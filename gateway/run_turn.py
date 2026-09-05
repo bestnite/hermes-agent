@@ -154,6 +154,22 @@ class GatewayTurnMixin:
                 self._session_state(skey).conversation.last_resolved_model = model
             self._session_state("*").conversation.last_resolved_model = model
 
+        # Fork patch (d99e0fae57): credential-pool/custom-provider resolution may
+        # conservatively return chat_completions even for GPT-5.x-compatible OpenAI
+        # gateways. Match AIAgent's model-family routing here too, because passing an
+        # explicit chat_completions api_mode prevents AIAgent from auto-upgrading later.
+        if runtime_kwargs.get("api_mode") == "chat_completions" and model:
+            try:
+                from run_agent import AIAgent
+
+                if AIAgent._provider_model_requires_responses_api(
+                    model,
+                    provider=runtime_kwargs.get("provider"),
+                ):
+                    runtime_kwargs["api_mode"] = "codex_responses"
+            except Exception:
+                pass
+
         return model, runtime_kwargs
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
@@ -179,6 +195,30 @@ class GatewayTurnMixin:
                 runtime["api_mode"], runtime["command"], tuple(runtime["args"]),
             ),
         }
+
+        # Fork patch (d99e0fae57): pass Responses text verbosity from config.
+        # Applies to every service tier — inject into the provider-level
+        # overrides before the fast-mode gate so normal/auto/cold turns (which
+        # return early below) still carry the configured text verbosity.
+        text_verbosity = ""
+        try:
+            from gateway.run import _load_gateway_config
+            from hermes_cli.config import cfg_get
+
+            raw = str(cfg_get(_load_gateway_config(), "agent", "text_verbosity", default="") or "").strip().lower()
+            if raw in {"low", "medium", "high"}:
+                text_verbosity = raw
+            elif raw:
+                logger.warning("Unknown text_verbosity '%s', ignoring", raw)
+        except Exception:
+            pass
+        if text_verbosity and runtime["api_mode"] == "codex_responses":
+            text = dict(base_request_overrides or {}).get("text")
+            text_obj = dict(text) if isinstance(text, dict) else {}
+            text_obj["verbosity"] = text_verbosity
+            base_request_overrides = dict(base_request_overrides or {})
+            base_request_overrides["text"] = text_obj
+
         if getattr(self, "_service_tier", None) != "priority":
             # None / auto / cold: the bounded window is applied per request by agent.fast_mode.
             route["request_overrides"] = base_request_overrides
