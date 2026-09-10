@@ -13,6 +13,7 @@ import json
 from unittest.mock import patch
 
 import pytest
+import requests
 
 import tools.web_tools as web_tools
 from agent import web_search_registry as registry
@@ -89,6 +90,15 @@ class TestParseMcpBody:
         with pytest.raises(keyless_mcp.KeylessMCPError):
             keyless_mcp._parse_mcp_body("<html>nope</html>")
 
+    def test_sse_body_with_unicode_boundary_char(self):
+        # U+0085 (and U+2028/29) inside the JSON is content, not SSE framing;
+        # str.splitlines() used to split the data line there and truncate the JSON.
+        text = "标题\u0085续行"
+        payload = json.dumps(
+            {"result": {"content": [{"type": "text", "text": text}]}}, ensure_ascii=False
+        )
+        assert keyless_mcp._parse_mcp_body(f"event: message\ndata: {payload}\n\n") == text
+
 
 class TestExaTextParsing:
     def test_parses_blocks(self):
@@ -164,6 +174,24 @@ class TestKeylessCalls:
         assert call.call_count == 2
         assert out[0]["title"] == "Page Title"
         assert out[0]["content"].startswith("# Page Title")
+
+    def test_mcp_call_decodes_sse_body_as_utf8(self, monkeypatch):
+        # requests decodes a charset-less text/event-stream as ISO-8859-1, so the
+        # UTF-8 bytes of CJK content arrive as mojibake with spurious U+0085 chars.
+        text = "外卖平台大数据杀熟实测：同地点不同配送费"
+        payload = json.dumps(
+            {"result": {"content": [{"type": "text", "text": text}]}}, ensure_ascii=False
+        )
+        body = f"event: message\ndata: {payload}\n\n".encode("utf-8")
+
+        class _Response:
+            status_code = 200
+            content = body
+            text = body.decode("iso-8859-1")  # what requests .text gives here
+
+        monkeypatch.setattr(requests, "post", lambda *args, **kwargs: _Response())
+        out = keyless_mcp.mcp_call("https://mcp.example/mcp", "web_fetch_exa", {"urls": ["u"]})
+        assert out == text
 
 
 # ---------------------------------------------------------------------------

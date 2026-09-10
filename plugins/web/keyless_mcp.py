@@ -138,7 +138,9 @@ def _parse_mcp_body(body: str) -> str:
 
     stripped = body.strip()
     candidates = [stripped] if stripped.startswith("{") else []
-    candidates += [line[len("data: "):] for line in body.splitlines() if line.startswith("data: ")]
+    # SSE framing lines end with \n; str.splitlines() also splits on Unicode
+    # boundaries (U+0085, U+2028/29) that legitimately appear inside the JSON string.
+    candidates += [line[len("data: "):] for line in body.split("\n") if line.startswith("data: ")]
     for candidate in candidates:
         try:
             text = _from_payload(candidate)
@@ -161,7 +163,10 @@ def mcp_call(url: str, tool: str, arguments: Dict[str, Any], timeout: int = _TIM
         raise KeylessMCPError(f"request failed: {exc}") from exc
     if response.status_code >= 400:
         raise KeylessMCPError(f"HTTP {response.status_code}: {response.text[:300]}")
-    return _parse_mcp_body(response.text)
+    # MCP JSON-RPC payloads are UTF-8; ``response.text`` guesses ISO-8859-1 for a
+    # charset-less ``text/event-stream``, mojibaking non-ASCII content (and turning
+    # CJK continuation bytes into U+0085 line boundaries that break SSE splitting).
+    return _parse_mcp_body(response.content.decode("utf-8", errors="replace"))
 
 
 # --- Parallel (search.parallel.ai) — JSON text payloads -----------------------
