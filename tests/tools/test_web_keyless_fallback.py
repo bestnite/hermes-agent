@@ -13,7 +13,6 @@ import json
 from unittest.mock import patch
 
 import pytest
-import requests
 
 import tools.web_tools as web_tools
 from agent import web_search_registry as registry
@@ -90,14 +89,64 @@ class TestParseMcpBody:
         with pytest.raises(keyless_mcp.KeylessMCPError):
             keyless_mcp._parse_mcp_body("<html>nope</html>")
 
-    def test_sse_body_with_unicode_boundary_char(self):
-        # U+0085 (and U+2028/29) inside the JSON is content, not SSE framing;
-        # str.splitlines() used to split the data line there and truncate the JSON.
-        text = "标题\u0085续行"
-        payload = json.dumps(
-            {"result": {"content": [{"type": "text", "text": text}]}}, ensure_ascii=False
-        )
-        assert keyless_mcp._parse_mcp_body(f"event: message\ndata: {payload}\n\n") == text
+    def test_cjk_sse_body_survives_charset_less_event_stream(self):
+        """Exa answers ``text/event-stream`` without a charset; ``requests`` then decodes ``.text`` as
+        ISO-8859-1, and the U+0085 inside CJK UTF-8 sequences split the ``data:`` line under
+        ``splitlines()`` — a valid CJK result surfaced as "Unrecognized MCP response shape"."""
+        import requests
+
+        title = "光伏发电站组件清洗与性能监测规范"
+        payload = {"result": {"content": [{"type": "text", "text": f"Title: {title}\nURL: https://x.example"}]}}
+        response = requests.Response()
+        response.status_code = 200
+        response.headers["Content-Type"] = "text/event-stream"
+        response.encoding = "ISO-8859-1"  # what the adapter picks for text/* without a charset
+        response._content = f"event: message\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+        assert "\x85" in response.text  # the vendor body really does decode to mojibake via .text
+        with patch.object(requests, "post", return_value=response):
+            text = keyless_mcp.mcp_call(keyless_mcp.EXA_MCP_URL, "web_search_exa", {"query": title})
+        assert title in text
+
+    def test_parsed_envelope_without_text_names_the_condition(self):
+        body = json.dumps({"result": {"content": []}})
+        with pytest.raises(keyless_mcp.KeylessMCPError, match="no text content"):
+            keyless_mcp._parse_mcp_body(body)
+
+    @pytest.mark.parametrize("terminator", ["\r", "\r\n"])
+    def test_sse_frames_split_on_every_spec_line_terminator(self, terminator):
+        """SSE permits CR, LF and CRLF as line terminators; splitting on ``\\n`` alone lost bare-CR frames."""
+        payload = json.dumps({"result": {"content": [{"type": "text", "text": "Title: hello"}]}})
+        body = f"event: message{terminator}data: {payload}{terminator}{terminator}"
+        assert keyless_mcp._parse_mcp_body(body) == "Title: hello"
+
+    def test_declared_charset_wins_over_utf8_default(self):
+        import requests
+
+        title = "你好"
+        payload = json.dumps({"result": {"content": [{"type": "text", "text": f"Title: {title}"}]}}, ensure_ascii=False)
+        response = requests.Response()
+        response.status_code = 200
+        response.headers["Content-Type"] = "text/event-stream; charset=gbk"
+        response.encoding = "gbk"
+        response._content = f"event: message\ndata: {payload}\n\n".encode("gbk")
+        with patch.object(requests, "post", return_value=response):
+            assert keyless_mcp.mcp_call(keyless_mcp.EXA_MCP_URL, "web_search_exa", {"query": title}) == f"Title: {title}"
+
+    @pytest.mark.parametrize("call", ["mcp", "keenable"])
+    def test_non_ascii_error_body_without_charset_is_decoded_as_utf8(self, call):
+        import requests
+
+        response = requests.Response()
+        response.status_code = 429
+        response.headers["Content-Type"] = "text/plain"
+        response.encoding = "ISO-8859-1"  # what the adapter picks for text/* without a charset
+        response._content = "请求过多".encode("utf-8")
+        with patch.object(requests, "post", return_value=response), patch.object(requests, "get", return_value=response):
+            with pytest.raises(keyless_mcp.KeylessMCPError, match="请求过多"):
+                if call == "mcp":
+                    keyless_mcp.mcp_call(keyless_mcp.EXA_MCP_URL, "web_search_exa", {"query": "q"})
+                else:
+                    keyless_mcp._keenable_request("get", "/v1/search/public")
 
 
 class TestExaTextParsing:
@@ -174,24 +223,6 @@ class TestKeylessCalls:
         assert call.call_count == 2
         assert out[0]["title"] == "Page Title"
         assert out[0]["content"].startswith("# Page Title")
-
-    def test_mcp_call_decodes_sse_body_as_utf8(self, monkeypatch):
-        # requests decodes a charset-less text/event-stream as ISO-8859-1, so the
-        # UTF-8 bytes of CJK content arrive as mojibake with spurious U+0085 chars.
-        text = "外卖平台大数据杀熟实测：同地点不同配送费"
-        payload = json.dumps(
-            {"result": {"content": [{"type": "text", "text": text}]}}, ensure_ascii=False
-        )
-        body = f"event: message\ndata: {payload}\n\n".encode("utf-8")
-
-        class _Response:
-            status_code = 200
-            content = body
-            text = body.decode("iso-8859-1")  # what requests .text gives here
-
-        monkeypatch.setattr(requests, "post", lambda *args, **kwargs: _Response())
-        out = keyless_mcp.mcp_call("https://mcp.example/mcp", "web_fetch_exa", {"urls": ["u"]})
-        assert out == text
 
 
 # ---------------------------------------------------------------------------
