@@ -15,7 +15,14 @@
  * bot-initiated sends use `hermes -p <bot> chat --in ~ -c "Bot Chat"`.
  */
 
-import { CHAT_EMPTY_AREA, COMPOSER_AREAS, host, LocalizedTabTitle, PALETTE_AREA, translateNow } from '@hermes/plugin-sdk'
+import {
+  CHAT_EMPTY_AREA,
+  COMPOSER_AREAS,
+  host,
+  LocalizedTabTitle,
+  PALETTE_AREA,
+  translateNow
+} from '@hermes/plugin-sdk'
 import type { ChatEmptyProps, PluginContext } from '@hermes/plugin-sdk'
 
 import { startFaceClock, stopFaceClock } from './avatar'
@@ -49,6 +56,7 @@ import {
   $groupChatWorkspace,
   assignLegacyThreads,
   handleSessionsGatewayTransition,
+  hydrateGroupChatTombstones,
   pullGroupChatServerState,
   scheduleGroupChatServerSync,
   setGroupChatSyncDisposed,
@@ -232,6 +240,21 @@ export default {
 
     // Hydrate persisted group-chat room logs (epoch/running are runtime-only
     // and always reset — a loop can't survive a window reload anyway).
+    // Disband memory must be in place before the first gateway pull merges
+    // a mirror that may still project a disbanded room (#105275) — the pull
+    // below awaits this, otherwise the first pull resurrects the room until
+    // the next one re-tombstones it.
+    let tombstonesHydrated: Promise<void> = Promise.resolve()
+
+    try {
+      // @ts-expect-error TODO(bot-mode-types): PluginStorage.get requires a fallback argument.
+      tombstonesHydrated = Promise.resolve(ctx.storage?.get?.('group-chat-tombstones'))
+        .then(value => hydrateGroupChatTombstones(value))
+        .catch(() => undefined)
+    } catch {
+      /* no storage — no remembered disbands this window */
+    }
+
     try {
       // @ts-expect-error TODO(bot-mode-types): PluginStorage.get requires a fallback argument.
       Promise.resolve(ctx.storage?.get?.('group-chats'))
@@ -253,6 +276,8 @@ export default {
                   // guard as the other maps — a held bot stays held across
                   // window restarts until explicitly released.
                   holds: room.holds && typeof room.holds === 'object' ? room.holds : {},
+                  externalCursors:
+                    room.externalCursors && typeof room.externalCursors === 'object' ? room.externalCursors : {},
                   members: Array.isArray(room.members) ? room.members : [],
                   roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
                   image: typeof room.image === 'string' && room.image ? room.image : null,
@@ -308,6 +333,7 @@ export default {
           // Receive before publish. A fresh Desktop with no local room cache
           // must hydrate the gateway projection instead of merely avoiding an
           // empty overwrite and then rendering an empty conversation.
+          await tombstonesHydrated
           await pullGroupChatServerState().catch(() => false)
           scheduleGroupChatServerSync($groupChats.get())
         })

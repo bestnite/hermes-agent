@@ -14,6 +14,7 @@ import { type CSSProperties, lazy, type ReactNode, Suspense, useCallback, useEff
 import { useLocation, useNavigate } from 'react-router'
 
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
+import { preserveLocalPendingTurnMessages } from '@/app/session/hooks/use-session-actions/utils'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { BootFailureOverlay } from '@/components/boot-failure-overlay'
 import { ConfirmHost } from '@/components/confirm-host'
@@ -252,9 +253,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         return
       }
 
-      void window.hermesDesktop?.recycleBackend?.(normalizeProfileKey($activeGatewayProfile.get())).catch(err =>
-        notifyError(err, translateNow('notifications.errors.restartHermesFailed'))
-      )
+      void window.hermesDesktop
+        ?.recycleBackend?.(normalizeProfileKey($activeGatewayProfile.get()))
+        .catch(err => notifyError(err, translateNow('notifications.errors.restartHermesFailed')))
     }
   }, [backendRestartRequest])
 
@@ -500,9 +501,16 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             state => ({
               ...state,
               // Post-turn rehydrate reads only the newest tail page — graft it
-              // onto any backfilled older pages instead of dropping them.
+              // onto any backfilled older pages instead of dropping them, and
+              // keep any un-acked optimistic `user-*` row, which lives nowhere
+              // else (a reconnect-triggered rehydrate would otherwise lose a
+              // message the user then has to retype). Same composition order
+              // as reconcileAuthoritativeChatMessages.
               messages: preserveLocalAssistantErrors(
-                graftRefreshedTailOntoBackfill(messages, state.messages),
+                preserveLocalPendingTurnMessages(
+                  graftRefreshedTailOntoBackfill(messages, state.messages),
+                  state.messages
+                ),
                 state.messages
               )
             }),
@@ -1319,7 +1327,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           />
         )}
         {!isHudWindow() && customWindowControls && (
-          <WslgWindowControls isFullscreen={Boolean(connection?.isFullscreen)} isMaximized={Boolean(connection?.isMaximized)} />
+          <WslgWindowControls
+            isFullscreen={Boolean(connection?.isFullscreen)}
+            isMaximized={Boolean(connection?.isMaximized)}
+          />
         )}
         {children}
       </div>
