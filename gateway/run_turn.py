@@ -345,29 +345,6 @@ class GatewayTurnMixin:
                 runtime["api_mode"], runtime["command"], tuple(runtime["args"]),
             ),
         }
-        # Fork patch (d99e0fae57): pass Responses text verbosity from config.
-        # Applies to every service tier — inject into the provider-level
-        # overrides before the fast-mode gate so normal/auto/cold turns (which
-        # return early below) still carry the configured text verbosity.
-        text_verbosity = ""
-        try:
-            from gateway.run import _load_gateway_config
-            from hermes_cli.config import cfg_get
-
-            raw = str(cfg_get(_load_gateway_config(), "agent", "text_verbosity", default="") or "").strip().lower()
-            if raw in {"low", "medium", "high"}:
-                text_verbosity = raw
-            elif raw:
-                logger.warning("Unknown text_verbosity '%s', ignoring", raw)
-        except Exception:
-            pass
-        if text_verbosity and runtime["api_mode"] == "codex_responses":
-            text = dict(base_request_overrides or {}).get("text")
-            text_obj = dict(text) if isinstance(text, dict) else {}
-            text_obj["verbosity"] = text_verbosity
-            base_request_overrides = dict(base_request_overrides or {})
-            base_request_overrides["text"] = text_obj
-
         tier = getattr(self, "_service_tier", None)
         if tier not in STATIC_TIERS:
             # None / auto / cold: the bounded window is applied per request by agent.fast_mode.
