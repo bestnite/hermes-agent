@@ -15,6 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from scripts.releases import optional_platforms
 from scripts.releases.draft_warning import draft_body
 from scripts.releases.versioning import (
     SEED, attempt_ref, derive_next_version, marker_ref, next_attempt,
@@ -69,13 +70,14 @@ def _require_remote_main(repo: Path, commit: str) -> None:
     result = subprocess.run(
         ["git", "merge-base", "--is-ancestor", commit, "refs/remotes/hermes-release/main"],
         cwd=repo, capture_output=True,
+        check=False,
     )
     if result.returncode != 0:
         raise ReleaseRefused(f"{commit} is not on origin/main")
 
 
 def _claim_collision(repo: Path, remote: str, tag: str, error: Exception) -> ReleaseRefused:
-    subprocess.run(["git", "tag", "--delete", tag], cwd=repo, capture_output=True)
+    subprocess.run(["git", "tag", "--delete", tag], cwd=repo, capture_output=True, check=False)
     try:
         _git(repo, "fetch", remote, f"+refs/tags/{tag}:refs/tags/{tag}")
         details = _git(
@@ -149,7 +151,7 @@ def _require_ancestry(repo: Path, commit: str, published_commit: str | None) -> 
     if published_commit is None:
         return
     ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", published_commit, commit], cwd=repo, capture_output=True)
+        ["git", "merge-base", "--is-ancestor", published_commit, commit], cwd=repo, capture_output=True, check=False)
     if ancestor.returncode != 0:
         raise ReleaseRefused(
             f"{commit} does not descend from the published stable head {published_commit}")
@@ -180,7 +182,7 @@ def _changelog(repo: Path, repository: str, *, commit: str, tag: str, version: s
     receipt = f"v{published_version}"
     if base is None and subprocess.run(
             ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{receipt}^{{commit}}"],
-            cwd=repo, capture_output=True).returncode == 0:
+            cwd=repo, capture_output=True, check=False).returncode == 0:
         # Before the first publication the seed version's tag is the base.
         base = receipt
     commits = release_script.get_commits(since_tag=base, until=commit, cwd=repo)
@@ -193,13 +195,16 @@ def _changelog(repo: Path, repository: str, *, commit: str, tag: str, version: s
 def release(commit: str, *, bump: str, repo: Path, remote: str, repository: str,
             execute, autopublish: bool = False, no_changelog: bool = False,
             skip_bundles: bool = False, skip_tests: bool = False,
+            include_macos_intel: bool = False, include_termux: bool = False,
             published: tuple[str, str | None] = (SEED, None),
             run_wait: float = 0, sleep=time.sleep) -> dict:
     """Claim the next attempt of the derived version, cut its draft, and start the gate.
 
     ``published`` is the stable channel's ``(version, commit)``; the commit is
-    None before the first publication. ``skip_bundles`` and ``skip_tests`` are
-    written into the claim, which is the one record every later job reads.
+    None before the first publication. ``skip_bundles``, ``skip_tests``,
+    ``include_macos_intel`` and ``include_termux`` are written into the claim,
+    which is the one record every later job reads. macOS Intel and Termux are
+    not built unless their include flag is set.
     ``run_wait`` is how many seconds to keep looking for the dispatched run;
     GitHub lists it a moment after the dispatch returns.
     """
@@ -245,6 +250,8 @@ def release(commit: str, *, bump: str, repo: Path, remote: str, repository: str,
         "autopublish": autopublish,
         "skipBundles": skip_bundles,
         "skipTests": skip_tests,
+        "includeMacosIntel": include_macos_intel,
+        "includeTermux": include_termux,
         "claimEpoch": claim_epoch,
     }, sort_keys=True, separators=(",", ":"))
     subprocess.check_output(
@@ -298,7 +305,8 @@ def release(commit: str, *, bump: str, repo: Path, remote: str, repository: str,
     return {"version": version, "tag": tag, "commit": commit, "url": url, "repository": repository,
             "final_url": f"https://github.com/{repository}/releases/tag/v{version}",
             "run_url": run_url, "autopublish": autopublish,
-            "skip_bundles": skip_bundles, "skip_tests": skip_tests}
+            "skip_bundles": skip_bundles, "skip_tests": skip_tests,
+            "include_macos_intel": include_macos_intel, "include_termux": include_termux}
 
 
 RUN_POLL_SECONDS = 2
@@ -469,6 +477,12 @@ def next_steps(result: dict, *, bold: bool = False) -> str:
     if result["skip_bundles"]:
         lines.append("Bundles are skipped. Only the tag, the GitHub release and the Docker image "
                      "ship; the desktop, Termux and Store channels stay on the previous release.")
+    else:
+        left_out = optional_platforms.excluded(result)
+        if left_out:
+            effects = "; ".join(p.left_out for p in left_out)
+            lines.append(f"Not built: {' and '.join(p.label for p in left_out)} (opt in with "
+                         f"{' / '.join(p.option for p in left_out)}). {effects[0].upper()}{effects[1:]}.")
     if result["skip_tests"]:
         warning = "Tests are skipped, since you passed --skip-tests"
         lines.append(f"\033[1m{warning}\033[0m" if bold else warning)
@@ -495,7 +509,7 @@ def cmd_release(args) -> None:
     commit = _git(repo, "rev-parse", "--verify", f"{args.commit}^{{commit}}")
 
     def execute(command: list[str]) -> None:
-        completed = subprocess.run(command, cwd=repo, capture_output=True, text=True, encoding="utf-8")
+        completed = subprocess.run(command, cwd=repo, capture_output=True, text=True, encoding="utf-8", check=False)
         if completed.returncode != 0:
             raise RuntimeError(completed.stderr.strip() or "release command failed")
         return completed.stdout
@@ -505,6 +519,7 @@ def cmd_release(args) -> None:
         commit, bump=args.bump, repo=repo, remote=remote, repository=repository,
         execute=execute, autopublish=args.autopublish, no_changelog=args.no_changelog,
         skip_bundles=args.skip_bundles, skip_tests=args.skip_tests,
+        include_macos_intel=args.include_macos_intel, include_termux=args.include_termux,
         published=published_stable_identity(repository), run_wait=RUN_WAIT_SECONDS,
     )
     print(next_steps(result, bold=sys.stdout.isatty() and "NO_COLOR" not in os.environ))
@@ -535,13 +550,13 @@ def _command_repository(args) -> tuple[Path, str, str]:
 
 
 def _execute(repo: Path, command: list[str]) -> None:
-    completed = subprocess.run(command, cwd=repo, capture_output=True, text=True, encoding="utf-8")
+    completed = subprocess.run(command, cwd=repo, capture_output=True, text=True, encoding="utf-8", check=False)
     if completed.returncode != 0:
         raise ReleaseRefused(completed.stderr.strip() or "release command failed")
 
 
 def _inspect(repo: Path, command: list[str]) -> str:
-    completed = subprocess.run(command, cwd=repo, capture_output=True, text=True, encoding="utf-8")
+    completed = subprocess.run(command, cwd=repo, capture_output=True, text=True, encoding="utf-8", check=False)
     if completed.returncode != 0:
         raise ReleaseRefused(completed.stderr.strip() or "release inspection failed")
     return completed.stdout
