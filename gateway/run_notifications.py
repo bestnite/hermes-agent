@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import dataclasses
 import json
 import logging
@@ -883,7 +884,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         gateway route or a refused notice pinned to a permanently-gone session (``_watch_pin_gone``).
         Not transactional: a crash after acceptance can replay (at-least-once).
         """
+        from gateway.session_local_recovery import restore_completion_route
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
+        restore_completion_route(self, str(evt.get("session_key") or ""))  # watch notices and heartbeats too
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
@@ -1234,10 +1237,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
     async def _deliver_completion_notification_scoped(
         self, synth_text: str, evt: dict, *, sibling_claims=(),
     ) -> Optional[bool]:
+        from gateway.session_local_recovery import restore_completion_route
         from gateway.wake import WakeNotAccepted
         from tools.process_registry_notifications import should_surface_notification
         if not should_surface_notification(evt):
             return None  # Suppressed noise is terminal, not a consumed process result.
+        restore_completion_route(self, str(evt.get("session_key") or ""))
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
         accepted = identity_claimed = refused = False
@@ -1473,7 +1478,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
 
     async def _deliver_async_delegation_group_scoped(self, group: list[dict]) -> Optional[bool]:
         from gateway.run import _format_gateway_process_notification
+        from gateway.session_local_recovery import restore_completion_route
         from tools.process_registry import process_registry as _pr
+        restore_completion_route(self, str(group[0].get("session_key") or ""))
         # API delivery does not start a model turn, so there is nothing to coalesce.
         # Keep each unit's stable identity with its row across partial delivery/retry.
         if group and group[0].get("origin_session_id"):
@@ -1757,18 +1764,31 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         tool thread. Waiting for the post-turn drain leaves a process that finishes while its
         launching turn is still running with no watcher at all (#112033). False = the gateway
         is not serving (startup, shutdown): the caller keeps the descriptor in
-        ``pending_watchers`` for the startup / post-turn drain."""
+        ``pending_watchers`` for the startup / post-turn drain.
+
+        The watcher starts in an empty context, as a recovered watcher does: scheduling copies the
+        CALLING thread's context, and the turns its completion admits inherit the watcher's. Armed
+        from a delegate child, a process handed to the parent completed into a parent turn that ran
+        as that child (its own notify watchers downgraded, sudo refused, the board fenced). Delivery
+        binds the owning profile's scope itself (``_completion_event_scope``)."""
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or not loop.is_running():
             return False
         from agent.async_utils import safe_schedule_threadsafe
-        future = safe_schedule_threadsafe(
-            self._run_process_watcher(watcher), loop, logger=logger,
+        future = contextvars.Context().run(
+            safe_schedule_threadsafe, self._run_process_watcher(watcher), loop, logger=logger,
             log_message="Live process watcher arming failed",
         )
         return future is not None
 
     async def _run_process_watcher(self, watcher: dict) -> None:
+        """Run :meth:`_watch_process` inside the owning profile's scope, start to finish. A watcher starts
+        in an empty context (live-armed from a tool thread, or recovered at startup), and the output it
+        prepares runs that profile's own ``transform_terminal_output`` hooks before any delivery."""
+        async with self._completion_event_scope(watcher):
+            await self._watch_process(watcher)
+
+    async def _watch_process(self, watcher: dict) -> None:
         """Poll a background process and push updates until it exits. Mode
         (``display.background_process_notifications``): concise (default one-liner; failures append
         the output tail) / all (running updates + final raw) / result (final raw) / error (final raw
@@ -1781,10 +1801,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         chat_id = watcher.get("chat_id", "")
         thread_id = watcher.get("thread_id", "")
         agent_notify = watcher.get("notify_on_complete", False)
-        # The mode belongs to the profile that started the process; recovered watchers run in the
-        # root context, so resolve it under the owning profile's scope (no-op for the default).
-        async with self._completion_event_scope(watcher):
-            notify_mode = self._load_background_notifications_mode()
+        notify_mode = self._load_background_notifications_mode()  # the owning profile's (scope bound above)
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
                       session_id, interval, notify_mode, agent_notify)
         silent = notify_mode == "off" and not agent_notify
@@ -1796,11 +1813,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             session = process_registry.get(session_id)
             if session is None:
                 break
-            async with self._completion_event_scope(watcher):
-                surface = should_surface_notification({
-                    "owner_task_id": getattr(session, "owner_task_id", ""),
-                    "task_id": getattr(session, "task_id", ""),
-                })
+            surface = should_surface_notification({
+                "owner_task_id": getattr(session, "owner_task_id", ""),
+                "task_id": getattr(session, "task_id", ""),
+            })
             if not surface:
                 # Recheck live ownership next tick: handoff retains notification intent.
                 if session.exited:
@@ -1876,11 +1892,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 ):
                     message_text = self._format_process_final_message(session_id, session, notify_mode)
                     from gateway.warning_notifications import present_notification
-                    async with self._completion_event_scope(watcher):
-                        # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
-                        await present_notification(
-                            lambda: self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher),
-                            platform=platform_name, diagnostic=session.exit_code not in {0, None})
+                    # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
+                    await present_notification(
+                        lambda: self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher),
+                        platform=platform_name, diagnostic=session.exit_code not in {0, None})
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output — deliver a status update (only in "all" mode; agent_notify watchers
